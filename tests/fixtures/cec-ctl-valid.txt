@@ -1,0 +1,5 @@
+Driver Info:
+	Driver Name                : CEC
+Logical Address             : Playback 1
+Physical Address            : 3.0.0.0
+Power Status                : On

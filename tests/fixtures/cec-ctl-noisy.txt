@@ -1,0 +1,5 @@
+Driver Info:
+	Adapter Hint               : 1.2.3.4
+	Status                     : waiting for 9.a.b.c
+Physical Address            : 3.0.0.0
+Power Status                : Standby
