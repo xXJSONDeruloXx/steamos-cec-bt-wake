@@ -1,14 +1,20 @@
 # SteamOS CEC + Bluetooth Wake
 
-Install and manage SteamOS CEC TV wake plus Bluetooth wake support.
+This script installs, verifies, and removes SteamOS CEC TV wake plus Bluetooth wake support for a DIY SteamOS PC. It is based on the guide shared in this Reddit post: [Guide: CEC + Bluetooth wake on a DIY SteamOS PC](https://www.reddit.com/r/SteamOS/comments/1uiuk4m/guide_cec_bluetooth_wake_on_a_diy_steamos_pc/).
+
+Install:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamos-cec-bt-wake/main/steamos-cec-bt-wake.sh | sudo bash -s -- --install
 ```
 
+Verify:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamos-cec-bt-wake/main/steamos-cec-bt-wake.sh | sudo bash -s -- --verify
 ```
+
+Uninstall:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamos-cec-bt-wake/main/steamos-cec-bt-wake.sh | sudo bash -s -- --uninstall
