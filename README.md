@@ -12,12 +12,6 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamos-cec-bt-wake/main/steamos-cec-bt-wake.sh | sudo bash -s -- --install
 ```
 
-Install non-interactively:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamos-cec-bt-wake/main/steamos-cec-bt-wake.sh | sudo bash -s -- --install --yes
-```
-
 Verify:
 
 ```sh
