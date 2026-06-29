@@ -326,7 +326,11 @@ write_file() {
 }
 
 install_cec_helper() {
-  cat <<EOF2 | write_file "$CEC_HELPER" 0755
+  generate_cec_helper_content | write_file "$CEC_HELPER" 0755
+}
+
+generate_cec_helper_content() {
+  cat <<EOF2
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -348,8 +352,7 @@ restart_cecd() {
 wait_for_cecd_object() {
   local attempt
   for attempt in \$(seq 1 10); do
-    if busctl --user get-name-owner "\$CEC_DEST" >/dev/null 2>&1 \
-      && busctl --user get-property "\$CEC_DEST" "\$CEC_OBJECT_PATH" "\$CEC_INTERFACE" Active >/dev/null 2>&1; then
+    if busctl --user get-property "\$CEC_DEST" "\$CEC_OBJECT_PATH" "\$CEC_INTERFACE" Active >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -367,9 +370,10 @@ call_cec() {
     if output="\$(gdbus call --session --dest "\$CEC_DEST" --object-path "\$CEC_OBJECT_PATH" --method "\$CEC_INTERFACE.\$method" "\$@" 2>&1)"; then
       [[ -n "\$output" ]] && log "\$method: \$output"
       return 0
+    else
+      rc=\$?
     fi
 
-    rc=\$?
     if [[ -n "\$output" ]]; then
       warn "\$method attempt \$attempt failed: \$output"
     else
@@ -413,7 +417,9 @@ main() {
   esac
 }
 
-main "\$@"
+if [[ "\${BASH_SOURCE[0]:-\$0}" == "\$0" ]]; then
+  main "\$@"
+fi
 EOF2
 }
 
@@ -457,7 +463,7 @@ WantedBy=suspend.target
 EOF2
 
   cat <<EOF2 | write_file "$STATE_FILE" 0644
-  CONFIG_VERSION=$EXPECTED_CONFIG_VERSION
+CONFIG_VERSION=$EXPECTED_CONFIG_VERSION
 DESKTOP_USER=$desktop_user
 DESKTOP_UID=$desktop_uid
 CEC_DEVICE=$CEC_DEVICE
@@ -592,10 +598,10 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  if run_as_desktop_user busctl --user get-name-owner "$CEC_DEST" >/dev/null 2>&1; then
-    printf 'OK   %s is present on the user session bus\n' "$CEC_DEST"
+  if run_as_desktop_user busctl --user get-property "$CEC_DEST" "$CEC_OBJECT_PATH" "$CEC_INTERFACE" Active >/dev/null 2>&1; then
+    printf 'OK   %s is reachable on the user session bus\n' "$CEC_DEST"
   else
-    printf 'FAIL %s is not present on the user session bus\n' "$CEC_DEST"
+    printf 'FAIL Could not reach the CEC D-Bus object on the user session bus\n'
     failures=$((failures + 1))
   fi
 
