@@ -4,21 +4,28 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 MODE="install"
 YES=0
-EXPECTED_CONFIG_VERSION=2
+EXPECTED_CONFIG_VERSION=3
 
 CEC_DEVICE="${CEC_DEVICE:-/dev/cec0}"
 CEC_DEST="com.steampowered.CecDaemon1"
 CEC_INTERFACE="com.steampowered.CecDaemon1.CecDevice1"
 CEC_OBJECT_PATH=""
 
+VAR_LIB_DIR="/var/lib/steamos-cec-bt-wake"
+LEGACY_HELPER_DIR="/etc/steamos-cec-bt-wake"
+STATE_FILE="$VAR_LIB_DIR/state.conf"
+LEGACY_STATE_FILE="/etc/steamos-cec-bt-wake.conf"
 CEC_SLEEP_SERVICE="/etc/systemd/system/cec-sleep.service"
 CEC_WAKE_SERVICE="/etc/systemd/system/cec-wake.service"
 BT_WAKE_SERVICE="/etc/systemd/system/bt-wakeup.service"
 BT_WAKE_RULE="/etc/udev/rules.d/91-bluetooth-wakeup.rules"
-BT_HELPER="/etc/steamos-cec-bt-wake/enable-bluetooth-wakeup"
-CEC_HELPER="/etc/steamos-cec-bt-wake/cec-control"
+CEC_HELPER="$VAR_LIB_DIR/cec-control"
+BT_HELPER="$VAR_LIB_DIR/enable-bluetooth-wakeup"
+LEGACY_CEC_HELPER="$LEGACY_HELPER_DIR/cec-control"
+LEGACY_BT_HELPER="$LEGACY_HELPER_DIR/enable-bluetooth-wakeup"
 MTK_RULE="/etc/udev/rules.d/99-btusb-mediatek.rules"
-STATE_FILE="/etc/steamos-cec-bt-wake.conf"
+ATOMIC_UPDATE_KEEP_DIR="/etc/atomic-update.conf.d"
+ATOMIC_UPDATE_KEEP_FILE="$ATOMIC_UPDATE_KEEP_DIR/steamos-cec-bt-wake.conf"
 
 DESKTOP_USER=""
 DESKTOP_UID=""
@@ -32,6 +39,7 @@ BT_SUBCLASS=""
 BT_PROTOCOL=""
 BT_MANUFACTURER=""
 BT_NAME=""
+STATE_SOURCE=""
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
@@ -266,7 +274,7 @@ select_line_from_candidates() {
   local prompt="$1"
   shift
   local candidates=("$@")
-  local line index
+  local index
 
   ((${#candidates[@]} > 0)) || return 1
 
@@ -323,6 +331,59 @@ select_bt_device() {
 write_file() {
   local path="$1" mode="$2"
   install -D -m "$mode" /dev/stdin "$path"
+}
+
+ensure_var_layout() {
+  install -d -m 0755 "$VAR_LIB_DIR"
+}
+
+migrate_legacy_layout() {
+  local migrated=0
+  ensure_var_layout
+
+  if [[ -r "$LEGACY_STATE_FILE" && ! -e "$STATE_FILE" ]]; then
+    install -m 0644 "$LEGACY_STATE_FILE" "$STATE_FILE"
+    migrated=1
+  fi
+
+  if [[ -r "$LEGACY_CEC_HELPER" && ! -e "$CEC_HELPER" ]]; then
+    install -m 0755 "$LEGACY_CEC_HELPER" "$CEC_HELPER"
+    migrated=1
+  fi
+
+  if [[ -r "$LEGACY_BT_HELPER" && ! -e "$BT_HELPER" ]]; then
+    install -m 0755 "$LEGACY_BT_HELPER" "$BT_HELPER"
+    migrated=1
+  fi
+
+  if (( migrated == 1 )); then
+    log "Migrated legacy /etc install data into $VAR_LIB_DIR"
+  fi
+}
+
+atomic_keep_paths() {
+  cat <<EOF2
+/etc/steamos-cec-bt-wake.conf
+/etc/steamos-cec-bt-wake/**
+/etc/systemd/system/cec-sleep.service
+/etc/systemd/system/cec-wake.service
+/etc/systemd/system/bt-wakeup.service
+/etc/udev/rules.d/91-bluetooth-wakeup.rules
+/etc/udev/rules.d/99-btusb-mediatek.rules
+/etc/atomic-update.conf.d/steamos-cec-bt-wake.conf
+EOF2
+}
+
+write_atomic_update_keep_list() {
+  install -d -m 0755 "$ATOMIC_UPDATE_KEEP_DIR"
+  {
+    printf '# Preserve steamos-cec-bt-wake files across SteamOS atomic updates.\n'
+    atomic_keep_paths
+  } | write_file "$ATOMIC_UPDATE_KEEP_FILE" 0644
+}
+
+remove_atomic_update_keep_list() {
+  rm -f "$ATOMIC_UPDATE_KEEP_FILE"
 }
 
 install_cec_helper() {
@@ -426,6 +487,7 @@ EOF2
 install_cec() {
   local desktop_user="$1" desktop_uid="$2" physical="$3" physical_int="$4"
 
+  ensure_var_layout
   install_cec_helper
 
   log "Writing CEC sleep and wake services"
@@ -476,6 +538,7 @@ EOF2
 }
 
 install_bt() {
+  ensure_var_layout
   log "Configuring Bluetooth wake for $BT_VENDOR:$BT_PRODUCT ($BT_MANUFACTURER $BT_NAME)"
 
   cat <<'EOF2' | write_file "$BT_HELPER" 0755
@@ -522,74 +585,116 @@ EOF2
   fi
 }
 
-load_state_file() {
-  [[ -r "$STATE_FILE" ]] || die "State file not found: $STATE_FILE"
+read_state_file() {
+  local path="$1"
+  [[ -r "$path" ]] || return 1
   # shellcheck disable=SC1090
-  source "$STATE_FILE"
+  source "$path"
+  STATE_SOURCE="$path"
+}
+
+load_any_state_file() {
+  STATE_SOURCE=""
+  if read_state_file "$STATE_FILE"; then
+    return 0
+  fi
+  if read_state_file "$LEGACY_STATE_FILE"; then
+    return 0
+  fi
+  return 1
+}
+
+get_service_execstart() {
+  local service_path="$1"
+  [[ -r "$service_path" ]] || return 1
+  sed -n 's/^ExecStart=//p' "$service_path" | head -n1
+}
+
+get_service_user() {
+  local service_path="$1"
+  [[ -r "$service_path" ]] || return 1
+  sed -n 's/^User=//p' "$service_path" | head -n1
+}
+
+get_service_runtime_uid() {
+  local service_path="$1"
+  [[ -r "$service_path" ]] || return 1
+  sed -nE 's#^Environment=XDG_RUNTIME_DIR=/run/user/([0-9]+)$#\1#p' "$service_path" | head -n1
 }
 
 get_wake_service_argument() {
   [[ -r "$CEC_WAKE_SERVICE" ]] || return 1
-  sed -nE "s|^ExecStart=${CEC_HELPER//\//\\/}[[:space:]]+wake[[:space:]]+([0-9]+)[[:space:]]*$|\1|p" "$CEC_WAKE_SERVICE" | head -n1
+  sed -nE 's#^ExecStart=.*[[:space:]]wake[[:space:]]+([0-9]+)[[:space:]]*$#\1#p' "$CEC_WAKE_SERVICE" | head -n1
 }
 
-verify() {
+configured_bt_ids_from_service() {
+  local execstart helper vendor product
+  execstart="$(get_service_execstart "$BT_WAKE_SERVICE" || true)"
+  [[ -n "$execstart" ]] || return 1
+  read -r helper vendor product _ <<<"$execstart"
+  [[ -n "$vendor" && -n "$product" ]] || return 1
+  printf '%s|%s|%s\n' "$helper" "$vendor" "$product"
+}
+
+infer_desktop_context_from_services() {
+  [[ -n "$DESKTOP_USER" ]] || DESKTOP_USER="$(get_service_user "$CEC_SLEEP_SERVICE" || true)"
+  [[ -n "$DESKTOP_UID" ]] || DESKTOP_UID="$(get_service_runtime_uid "$CEC_SLEEP_SERVICE" || true)"
+  if [[ -n "$DESKTOP_USER" && -z "$DESKTOP_UID" ]] && id "$DESKTOP_USER" >/dev/null 2>&1; then
+    DESKTOP_UID="$(id -u "$DESKTOP_USER")"
+  fi
+}
+
+report_file_status() {
+  local label="$1" path="$2"
+  if [[ -e "$path" ]]; then
+    printf 'OK   %s exists: %s\n' "$label" "$path"
+    return 0
+  fi
+  printf 'FAIL %s missing: %s\n' "$label" "$path"
+  return 1
+}
+
+report_service_installed() {
+  local service_name="$1" service_path="$2"
   local failures=0
-  local live_integer live_physical active_state wake_argument
-  local matched=0 dev wake
+  if ! report_file_status "$service_name unit" "$service_path"; then
+    failures=$((failures + 1))
+  fi
+  if systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
+    printf 'OK   %s enabled\n' "$service_name"
+  else
+    printf 'FAIL %s not enabled\n' "$service_name"
+    failures=$((failures + 1))
+  fi
+  return "$failures"
+}
 
-  load_state_file
-  configure_cec_device
-
-  if [[ -z "${DESKTOP_USER:-}" || -z "${DESKTOP_UID:-}" ]]; then
-    printf 'FAIL Missing desktop user context in %s\n' "$STATE_FILE"
+report_cec_devices() {
+  local found=0 dev
+  for dev in /dev/cec*; do
+    [[ -e "$dev" ]] || continue
+    if (( found == 0 )); then
+      printf 'OK   Detected CEC device(s):\n'
+    fi
+    printf '     %s\n' "$dev"
+    found=1
+  done
+  if (( found == 0 )); then
+    printf 'FAIL No /dev/cec* devices detected\n'
     return 1
   fi
+  return 0
+}
 
-  printf '\nCEC\n---\n'
+report_cecd_inventory() {
+  local failures=0 active_state live_integer live_physical
 
-  if [[ "${CONFIG_VERSION:-0}" != "$EXPECTED_CONFIG_VERSION" ]]; then
-    printf 'WARN Config version is %s, expected %s\n' "${CONFIG_VERSION:-unknown}" "$EXPECTED_CONFIG_VERSION"
+  if [[ -z "$DESKTOP_USER" || -z "$DESKTOP_UID" ]]; then
+    printf 'WARN Could not infer the desktop user context; skipping cecd D-Bus checks\n'
+    return 0
   fi
 
-  if ! validate_physical_integer "${CEC_PHYSICAL_INTEGER:-}"; then
-    if [[ "${CEC_PHYSICAL_INTEGER:-}" =~ ^[0-9]+$ ]] && (( CEC_PHYSICAL_INTEGER > 65535 )); then
-      printf 'FAIL This installation was created by a version with the old CEC address conversion bug. Re-run --install to repair it.\n'
-    else
-      printf 'FAIL Invalid stored CEC physical address integer: %s\n' "${CEC_PHYSICAL_INTEGER:-missing}"
-    fi
-    failures=$((failures + 1))
-  fi
-
-  if validate_physical_address "${CEC_PHYSICAL_ADDRESS:-}"; then
-    printf 'OK   Stored CEC physical address: %s\n' "$CEC_PHYSICAL_ADDRESS"
-  else
-    printf 'FAIL Invalid stored CEC physical address: %s\n' "${CEC_PHYSICAL_ADDRESS:-missing}"
-    failures=$((failures + 1))
-  fi
-
-  if [[ -e "${CEC_DEVICE:-/dev/cec0}" ]]; then
-    printf 'OK   CEC device exists: %s\n' "${CEC_DEVICE:-/dev/cec0}"
-  else
-    printf 'FAIL CEC device missing: %s\n' "${CEC_DEVICE:-/dev/cec0}"
-    failures=$((failures + 1))
-  fi
-
-  if [[ -r "$CEC_HELPER" ]]; then
-    printf 'OK   CEC helper exists: %s\n' "$CEC_HELPER"
-  else
-    printf 'FAIL CEC helper missing: %s\n' "$CEC_HELPER"
-    failures=$((failures + 1))
-  fi
-
-  for svc in cec-sleep.service cec-wake.service; do
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      printf 'OK   %s enabled\n' "$svc"
-    else
-      printf 'FAIL %s not enabled\n' "$svc"
-      failures=$((failures + 1))
-    fi
-  done
+  printf 'OK   Desktop user context: %s (UID %s)\n' "$DESKTOP_USER" "$DESKTOP_UID"
 
   if run_as_desktop_user systemctl --user is-active --quiet cecd.service 2>/dev/null; then
     printf 'OK   cecd.service active in the user manager\n'
@@ -605,12 +710,7 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  active_state="$(
-    {
-      run_as_desktop_user busctl --user get-property "$CEC_DEST" "$CEC_OBJECT_PATH" "$CEC_INTERFACE" Active 2>/dev/null |
-        awk 'NR==1 {print $2}'
-    } || true
-  )"
+  active_state="$({ run_as_desktop_user busctl --user get-property "$CEC_DEST" "$CEC_OBJECT_PATH" "$CEC_INTERFACE" Active 2>/dev/null | awk 'NR==1 {print $2}'; } || true)"
   if [[ "$active_state" == "true" ]]; then
     printf 'OK   cecd Active property is true\n'
   elif [[ -n "$active_state" ]]; then
@@ -634,6 +734,55 @@ verify() {
     failures=$((failures + 1))
   fi
 
+  if [[ -n "${CEC_PHYSICAL_INTEGER:-}" && -n "$live_integer" && "$CEC_PHYSICAL_INTEGER" == "$live_integer" ]]; then
+    printf 'OK   Stored CEC physical integer matches cecd\n'
+  elif [[ -n "${CEC_PHYSICAL_INTEGER:-}" && -n "$live_integer" ]]; then
+    printf 'FAIL Stored CEC physical integer (%s) does not match cecd (%s)\n' "$CEC_PHYSICAL_INTEGER" "$live_integer"
+    failures=$((failures + 1))
+  fi
+
+  return "$failures"
+}
+
+report_state_inventory() {
+  local failures=0 wake_argument
+
+  if load_any_state_file; then
+    printf 'OK   State file loaded: %s\n' "$STATE_SOURCE"
+    if [[ "$STATE_SOURCE" == "$LEGACY_STATE_FILE" ]]; then
+      printf 'WARN Using legacy state path; re-run --install to migrate state into %s\n' "$STATE_FILE"
+    fi
+  else
+    printf 'WARN State file missing from %s and %s\n' "$STATE_FILE" "$LEGACY_STATE_FILE"
+    return 0
+  fi
+
+  if [[ "${CONFIG_VERSION:-0}" != "$EXPECTED_CONFIG_VERSION" ]]; then
+    printf 'WARN Config version is %s, expected %s\n' "${CONFIG_VERSION:-unknown}" "$EXPECTED_CONFIG_VERSION"
+  fi
+
+  if validate_physical_address "${CEC_PHYSICAL_ADDRESS:-}"; then
+    printf 'OK   Stored CEC physical address: %s\n' "$CEC_PHYSICAL_ADDRESS"
+  else
+    printf 'FAIL Invalid stored CEC physical address: %s\n' "${CEC_PHYSICAL_ADDRESS:-missing}"
+    failures=$((failures + 1))
+  fi
+
+  if ! validate_physical_integer "${CEC_PHYSICAL_INTEGER:-}"; then
+    if [[ "${CEC_PHYSICAL_INTEGER:-}" =~ ^[0-9]+$ ]] && (( CEC_PHYSICAL_INTEGER > 65535 )); then
+      printf 'FAIL This installation was created by a version with the old CEC address conversion bug. Re-run --install to repair it.\n'
+    else
+      printf 'FAIL Invalid stored CEC physical address integer: %s\n' "${CEC_PHYSICAL_INTEGER:-missing}"
+    fi
+    failures=$((failures + 1))
+  else
+    printf 'OK   Stored CEC physical integer: %s\n' "$CEC_PHYSICAL_INTEGER"
+  fi
+
+  if [[ -n "${CEC_DEVICE:-}" ]]; then
+    printf 'OK   Stored CEC device: %s\n' "$CEC_DEVICE"
+  fi
+
   wake_argument="$(get_wake_service_argument || true)"
   if [[ -n "$wake_argument" ]]; then
     printf 'OK   cec-wake.service SetActiveSource argument: %s\n' "$wake_argument"
@@ -642,55 +791,253 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  if [[ -n "${CEC_PHYSICAL_INTEGER:-}" && -n "$live_integer" && "$CEC_PHYSICAL_INTEGER" == "$live_integer" ]]; then
-    printf 'OK   Stored CEC physical integer matches cecd\n'
-  else
-    printf 'FAIL Stored CEC physical integer (%s) does not match cecd (%s)\n' "${CEC_PHYSICAL_INTEGER:-missing}" "${live_integer:-missing}"
-    failures=$((failures + 1))
-  fi
-
   if [[ -n "${CEC_PHYSICAL_INTEGER:-}" && -n "$wake_argument" && "$CEC_PHYSICAL_INTEGER" == "$wake_argument" ]]; then
     printf 'OK   Wake service argument matches the stored CEC physical integer\n'
-  else
-    printf 'FAIL Wake service argument (%s) does not match the stored CEC physical integer (%s)\n' "${wake_argument:-missing}" "${CEC_PHYSICAL_INTEGER:-missing}"
+  elif [[ -n "${CEC_PHYSICAL_INTEGER:-}" && -n "$wake_argument" ]]; then
+    printf 'FAIL Wake service argument (%s) does not match the stored CEC physical integer (%s)\n' "$wake_argument" "$CEC_PHYSICAL_INTEGER"
     failures=$((failures + 1))
   fi
 
-  printf '\nBluetooth wake\n--------------\n'
-  if systemctl is-enabled --quiet bt-wakeup.service 2>/dev/null; then
-    printf 'OK   bt-wakeup.service enabled\n'
+  return "$failures"
+}
+
+report_bt_hardware_inventory() {
+  local configured vendor product helper matched=0 dev wake failures=0
+  local path class subclass protocol manufacturer name
+  local candidates=()
+
+  mapfile -t candidates < <(list_bt_candidates)
+  if ((${#candidates[@]} > 0)); then
+    printf 'OK   Detected Bluetooth HCI controller USB parent(s):\n'
+    for configured in "${candidates[@]}"; do
+      IFS='|' read -r path vendor product class subclass protocol manufacturer name <<<"$configured"
+      printf '     %s  %s:%s  %s %s\n' "$path" "$vendor" "$product" "$manufacturer" "$name"
+    done
   else
-    printf 'FAIL bt-wakeup.service not enabled\n'
+    printf 'FAIL No Bluetooth HCI controller with a USB parent was detected\n'
+    return 1
+  fi
+
+  configured="$(configured_bt_ids_from_service || true)"
+  if [[ -n "$configured" ]]; then
+    IFS='|' read -r helper vendor product <<<"$configured"
+    printf 'OK   Configured Bluetooth wake target: %s:%s\n' "$vendor" "$product"
+    printf 'OK   bt-wakeup helper path: %s\n' "$helper"
+  elif [[ -n "${BT_VENDOR:-}" && -n "${BT_PRODUCT:-}" ]]; then
+    vendor="$BT_VENDOR"
+    product="$BT_PRODUCT"
+    printf 'OK   Stored Bluetooth wake target: %s:%s\n' "$vendor" "$product"
+  else
+    printf 'WARN No configured Bluetooth vendor/product IDs were found\n'
+    return 0
+  fi
+
+  for dev in /sys/bus/usb/devices/*; do
+    [[ -f "$dev/idVendor" && -f "$dev/idProduct" ]] || continue
+    [[ "$(basename "$dev")" == *:* ]] && continue
+    [[ "$(<"$dev/idVendor")" == "$vendor" && "$(<"$dev/idProduct")" == "$product" ]] || continue
+    matched=1
+    wake="$(cat "$dev/power/wakeup" 2>/dev/null || echo unavailable)"
+    if [[ "$wake" == "enabled" ]]; then
+      printf 'OK   %s (%s:%s) wakeup enabled\n' "$(basename "$dev")" "$vendor" "$product"
+    else
+      printf 'FAIL %s (%s:%s) wakeup is %s\n' "$(basename "$dev")" "$vendor" "$product" "$wake"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if (( matched == 0 )); then
+    printf 'FAIL Bluetooth device %s:%s not found\n' "$vendor" "$product"
     failures=$((failures + 1))
   fi
 
-  if [[ -r "$BT_WAKE_RULE" ]]; then
-    printf 'OK   Bluetooth udev rule exists: %s\n' "$BT_WAKE_RULE"
+  return "$failures"
+}
+
+keep_list_covers_path() {
+  local path="$1"
+  [[ -r "$ATOMIC_UPDATE_KEEP_FILE" ]] || return 1
+  grep -Fqx "$path" "$ATOMIC_UPDATE_KEEP_FILE"
+}
+
+verify_atomic_keep_list() {
+  local failures=0 path
+  local required_paths=()
+  mapfile -t required_paths < <(atomic_keep_paths)
+
+  if [[ -r "$ATOMIC_UPDATE_KEEP_FILE" ]]; then
+    printf 'OK   Atomic-update keep-list exists: %s\n' "$ATOMIC_UPDATE_KEEP_FILE"
   else
-    printf 'FAIL Bluetooth udev rule missing: %s\n' "$BT_WAKE_RULE"
-    failures=$((failures + 1))
+    printf 'FAIL Atomic-update keep-list missing: %s\n' "$ATOMIC_UPDATE_KEEP_FILE"
+    return 1
   fi
 
-  if [[ -n "${BT_VENDOR:-}" && -n "${BT_PRODUCT:-}" ]]; then
-    for dev in /sys/bus/usb/devices/*; do
-      [[ -f "$dev/idVendor" && -f "$dev/idProduct" ]] || continue
-      [[ "$(basename "$dev")" == *:* ]] && continue
-      [[ "$(<"$dev/idVendor")" == "$BT_VENDOR" && "$(<"$dev/idProduct")" == "$BT_PRODUCT" ]] || continue
-      matched=1
-      wake="$(cat "$dev/power/wakeup" 2>/dev/null || echo unavailable)"
-      if [[ "$wake" == "enabled" ]]; then
-        printf 'OK   %s (%s:%s) wakeup enabled\n' "$(basename "$dev")" "$BT_VENDOR" "$BT_PRODUCT"
+  for path in "${required_paths[@]}"; do
+    if keep_list_covers_path "$path"; then
+      printf 'OK   Keep-list preserves %s\n' "$path"
+    else
+      printf 'FAIL Keep-list missing %s\n' "$path"
+      failures=$((failures + 1))
+    fi
+  done
+
+  for path in "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE"; do
+    if [[ -e "$path" ]]; then
+      if keep_list_covers_path "$path"; then
+        printf 'OK   Keep-list covers installed path %s\n' "$path"
       else
-        printf 'FAIL %s (%s:%s) wakeup is %s\n' "$(basename "$dev")" "$BT_VENDOR" "$BT_PRODUCT" "$wake"
+        printf 'FAIL Keep-list does not cover installed path %s\n' "$path"
         failures=$((failures + 1))
       fi
-    done
-    (( matched )) || {
-      printf 'FAIL Bluetooth device %s:%s not found\n' "$BT_VENDOR" "$BT_PRODUCT"
+    fi
+  done
+
+  if [[ -e "$LEGACY_STATE_FILE" ]]; then
+    if keep_list_covers_path "$LEGACY_STATE_FILE"; then
+      printf 'OK   Keep-list covers legacy path %s\n' "$LEGACY_STATE_FILE"
+    else
+      printf 'FAIL Keep-list does not cover legacy path %s\n' "$LEGACY_STATE_FILE"
       failures=$((failures + 1))
-    }
+    fi
+  fi
+
+  if [[ -d "$LEGACY_HELPER_DIR" ]]; then
+    if keep_list_covers_path "$LEGACY_HELPER_DIR/**"; then
+      printf 'OK   Keep-list covers legacy directory %s/**\n' "$LEGACY_HELPER_DIR"
+    else
+      printf 'FAIL Keep-list does not cover legacy directory %s/**\n' "$LEGACY_HELPER_DIR"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  return "$failures"
+}
+
+report_holo_sync_var_status() {
+  local output rc=0 path matched=0
+  local project_paths=(
+    "$CEC_SLEEP_SERVICE"
+    "$CEC_WAKE_SERVICE"
+    "$BT_WAKE_SERVICE"
+    "$BT_WAKE_RULE"
+    "$MTK_RULE"
+    "$ATOMIC_UPDATE_KEEP_FILE"
+    "$LEGACY_STATE_FILE"
+    "$LEGACY_HELPER_DIR"
+    "$STATE_FILE"
+    "$CEC_HELPER"
+    "$BT_HELPER"
+  )
+
+  if [[ ! -x /usr/lib/holo/holo-sync-var ]]; then
+    printf 'WARN /usr/lib/holo/holo-sync-var not available; skipped SteamOS update dry-run\n'
+    return 0
+  fi
+
+  output="$(/usr/lib/holo/holo-sync-var --dry-run all 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    printf 'WARN /usr/lib/holo/holo-sync-var --dry-run all failed with exit code %d\n' "$rc"
+    return 0
+  fi
+
+  for path in "${project_paths[@]}"; do
+    if grep -Fq "$path" <<<"$output"; then
+      if (( matched == 0 )); then
+        printf 'WARN SteamOS dry-run reported project paths that may be discarded by the next update:\n'
+      fi
+      printf '     %s\n' "$path"
+      matched=1
+    fi
+  done
+
+  if (( matched == 0 )); then
+    printf 'OK   SteamOS dry-run did not report project-managed paths as discard candidates\n'
+  fi
+}
+
+verify() {
+  local failures=0 state_rc service_rc bt_rc cecd_rc keep_rc partial_damage=0
+
+  DESKTOP_USER=""
+  DESKTOP_UID=""
+  STATE_SOURCE=""
+  CEC_PHYSICAL_ADDRESS="${CEC_PHYSICAL_ADDRESS:-}"
+  CEC_PHYSICAL_INTEGER="${CEC_PHYSICAL_INTEGER:-}"
+  BT_VENDOR="${BT_VENDOR:-}"
+  BT_PRODUCT="${BT_PRODUCT:-}"
+
+  load_any_state_file || true
+  infer_desktop_context_from_services
+  if [[ -n "${CEC_DEVICE:-}" ]]; then
+    configure_cec_device
+  fi
+
+  printf '\nLayout\n------\n'
+  if [[ -d "$VAR_LIB_DIR" ]]; then
+    printf 'OK   Persistent data directory exists: %s\n' "$VAR_LIB_DIR"
   else
-    printf 'WARN No saved Bluetooth vendor/product IDs found\n'
+    printf 'FAIL Persistent data directory missing: %s\n' "$VAR_LIB_DIR"
+    failures=$((failures + 1))
+  fi
+
+  if report_file_status "CEC helper" "$CEC_HELPER"; then :; else failures=$((failures + 1)); partial_damage=1; fi
+  if report_file_status "Bluetooth helper" "$BT_HELPER"; then :; else failures=$((failures + 1)); partial_damage=1; fi
+
+  if [[ -e "$LEGACY_CEC_HELPER" || -e "$LEGACY_BT_HELPER" || -e "$LEGACY_STATE_FILE" ]]; then
+    printf 'WARN Legacy /etc install paths still exist. Re-running --install migrates the active layout to %s.\n' "$VAR_LIB_DIR"
+  fi
+
+  printf '\nCEC\n---\n'
+  if report_cec_devices; then :; else failures=$((failures + 1)); fi
+  report_state_inventory
+  state_rc=$?
+  failures=$((failures + state_rc))
+  (( state_rc > 0 )) && partial_damage=1
+
+  report_service_installed cec-sleep.service "$CEC_SLEEP_SERVICE"
+  service_rc=$?
+  failures=$((failures + service_rc))
+  (( service_rc > 0 )) && partial_damage=1
+
+  report_service_installed cec-wake.service "$CEC_WAKE_SERVICE"
+  service_rc=$?
+  failures=$((failures + service_rc))
+  (( service_rc > 0 )) && partial_damage=1
+
+  report_cecd_inventory
+  cecd_rc=$?
+  failures=$((failures + cecd_rc))
+
+  printf '\nBluetooth wake\n--------------\n'
+  report_service_installed bt-wakeup.service "$BT_WAKE_SERVICE"
+  service_rc=$?
+  failures=$((failures + service_rc))
+  (( service_rc > 0 )) && partial_damage=1
+
+  if report_file_status "Bluetooth udev rule" "$BT_WAKE_RULE"; then :; else failures=$((failures + 1)); partial_damage=1; fi
+  if [[ -e "$MTK_RULE" ]]; then
+    printf 'OK   Optional MediaTek rule exists: %s\n' "$MTK_RULE"
+  else
+    printf 'WARN Optional MediaTek rule not installed\n'
+  fi
+
+  report_bt_hardware_inventory
+  bt_rc=$?
+  failures=$((failures + bt_rc))
+
+  printf '\nSteamOS atomic updates\n----------------------\n'
+  verify_atomic_keep_list
+  keep_rc=$?
+  failures=$((failures + keep_rc))
+  report_holo_sync_var_status
+
+  if [[ -z "$STATE_SOURCE" ]] && ([[ -e "$CEC_SLEEP_SERVICE" ]] || [[ -e "$CEC_WAKE_SERVICE" ]] || [[ -e "$BT_WAKE_SERVICE" ]] || [[ -e "$BT_WAKE_RULE" ]] || [[ -e "$CEC_HELPER" ]] || [[ -e "$BT_HELPER" ]]); then
+    partial_damage=1
+    printf 'WARN Recoverable partial-install damage detected: project files exist but the state file is missing. Re-run --install to regenerate %s.\n' "$STATE_FILE"
+  fi
+
+  if (( partial_damage == 1 )); then
+    printf 'WARN Recoverable partial-install damage was detected. Re-running --install should repair missing project-managed files.\n'
   fi
 
   printf '\n'
@@ -706,7 +1053,11 @@ uninstall_all() {
   log "Disabling installed services"
   systemctl disable --now cec-sleep.service cec-wake.service bt-wakeup.service 2>/dev/null || true
   rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$BT_WAKE_SERVICE" \
-    "$BT_WAKE_RULE" "$BT_HELPER" "$CEC_HELPER" "$MTK_RULE" "$STATE_FILE"
+    "$BT_WAKE_RULE" "$MTK_RULE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
+    "$CEC_HELPER" "$BT_HELPER" "$LEGACY_CEC_HELPER" "$LEGACY_BT_HELPER"
+  remove_atomic_update_keep_list
+  rmdir "$VAR_LIB_DIR" 2>/dev/null || true
+  rmdir "$LEGACY_HELPER_DIR" 2>/dev/null || true
   systemctl daemon-reload
   udevadm control --reload-rules 2>/dev/null || true
   log "Removed CEC and Bluetooth wake configuration installed by this script"
@@ -723,7 +1074,6 @@ main() {
       exit 0
       ;;
     verify)
-      load_state_file
       verify
       exit $?
       ;;
@@ -735,6 +1085,7 @@ main() {
   command_exists busctl || die "busctl is required."
   command_exists runuser || die "runuser is required."
 
+  migrate_legacy_layout
   DESKTOP_USER="$(detect_desktop_user)"
   DESKTOP_UID="$(id -u "$DESKTOP_USER")"
   detect_cec_physical_address
@@ -750,10 +1101,12 @@ Detected configuration:
   Active-source value:$CEC_PHYSICAL_INTEGER_DETECTED
   Bluetooth USB:      $BT_PATH ($BT_VENDOR:$BT_PRODUCT)
   Bluetooth name:     ${BT_MANUFACTURER:-} ${BT_NAME:-}
+  Persistent layout:  $VAR_LIB_DIR
 SUMMARY
 
   confirm "Install this configuration?" || die "Cancelled."
 
+  write_atomic_update_keep_list
   install_cec "$DESKTOP_USER" "$DESKTOP_UID" "$CEC_PHYSICAL_ADDRESS_DETECTED" "$CEC_PHYSICAL_INTEGER_DETECTED"
   install_bt
 
